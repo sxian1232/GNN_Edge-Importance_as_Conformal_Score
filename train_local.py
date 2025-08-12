@@ -1,85 +1,81 @@
-# train_local.py
 import argparse
 import os
 import json
+import time
 import torch
 import numpy as np
 from model import Model
 from main import run_trainval
-from typing import Optional
 
-def ensure_parent(path: str):
-    d = os.path.dirname(path)
-    if d and not os.path.exists(d):
-        os.makedirs(d, exist_ok=True)
+def get_device():
+    return torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
 
-def load_init_weights_if_any(model: torch.nn.Module, init_model_path: Optional[str]):
+def load_init_weights_if_any(model, init_model_path):
     if not init_model_path:
         return
+    if not os.path.exists(init_model_path):
+        raise FileNotFoundError(init_model_path)
     ckpt = torch.load(init_model_path, map_location="cpu")
-    # 兼容两种常见保存格式
-    state = ckpt.get("xin_graph_seq2seq_model", ckpt)
-    model.load_state_dict(state, strict=False)
-    print(f"[INFO] Loaded init weights from {init_model_path}")
-
-def save_edge_importance(model: Model, out_edge_path: str):
-    with torch.no_grad():
-        edge_importance = [p.detach().cpu().numpy() for p in model.edge_importance]
-    ensure_parent(out_edge_path)
-    np.save(out_edge_path, edge_importance)
-    print(f"[SAVE] edge importance -> {out_edge_path}")
-
-def save_model(model: Model, out_model_path: str):
-    ensure_parent(out_model_path)
-    torch.save({"xin_graph_seq2seq_model": model.state_dict()}, out_model_path)
-    print(f"[SAVE] model -> {out_model_path}")
+    state = ckpt["xin_graph_seq2seq_model"] if isinstance(ckpt, dict) and "xin_graph_seq2seq_model" in ckpt else ckpt
+    model.load_state_dict(state, strict=True)
 
 def main():
-    parser = argparse.ArgumentParser(description="Train a local GNN client with flexible I/O paths.")
-    parser.add_argument("--train_data", required=True, help="Path to train_data_*.pkl")
-    parser.add_argument("--test_data", default="processed_data/test_data.pkl", help="Path to test_data.pkl")
-    parser.add_argument("--init_model", default=None, help="Optional path to init/warm-start model.pt")
-    parser.add_argument("--out_model", required=True, help="Where to save trained local model .pt")
-    parser.add_argument("--out_edge", required=True, help="Where to save edge importance .npy")
-    parser.add_argument("--out_metrics", default=None, help="Optional: save a JSON with test metrics")
-    # 下面两个通常不改，保持与现有工程一致
-    parser.add_argument("--in_channels", type=int, default=4)
-    parser.add_argument("--num_node", type=int, default=120)
-    parser.add_argument("--max_hop", type=int, default=2)
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--train_data', type=str, required=True)
+    parser.add_argument('--test_data',  type=str, required=True)
+    parser.add_argument('--out_model',  type=str, required=True)
+    parser.add_argument('--out_edge',   type=str, required=True)
+    parser.add_argument('--init_model', type=str, default=None)
+    # NEW: optional metrics json
+    parser.add_argument('--metrics_out', type=str, default=None)
     args = parser.parse_args()
 
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    graph_args = {"max_hop": args.max_hop, "num_node": args.num_node}
+    # 保持原有行为：只确保模型和edge保存路径存在
+    os.makedirs(os.path.dirname(args.out_model), exist_ok=True)
+    os.makedirs(os.path.dirname(args.out_edge),  exist_ok=True)
 
-    model = Model(in_channels=args.in_channels, graph_args=graph_args, edge_importance_weighting=True).to(device)
+    device = get_device()
+    graph_args = {'max_hop': 2, 'num_node': 120}
+    model = Model(in_channels=4, graph_args=graph_args, edge_importance_weighting=True).to(device)
+
+    # 可选 warm start
     load_init_weights_if_any(model, args.init_model)
 
-    # 训练 + 验证（保持与你的 main.run_trainval 一致的签名）
-    # 如果 run_trainval 返回了测试指标，就记录下来；若无返回，也不报错
-    maybe_metrics = run_trainval(
-        model,
-        pra_traindata_path=args.train_data,
-        pra_testdata_path=args.test_data
-    )
+    # 训练+验证（与原 run_trainval 签名一致）
+    ret = run_trainval(model, pra_traindata_path=args.train_data, pra_testdata_path=args.test_data)
 
-    # 保存产物
-    save_edge_importance(model, args.out_edge)
-    save_model(model, args.out_model)
+    # 保存 edge importance
+    with torch.no_grad():
+        edge_importance = [param.detach().cpu().numpy() for param in model.edge_importance]
+        np.save(args.out_edge, edge_importance)
+        print(f"Saved edge importance to {args.out_edge}")
 
-    # 记录指标（可选）
-    if args.out_metrics is not None:
-        ensure_parent(args.out_metrics)
-        payload = {}
-        # 兼容 tuple / dict / None
-        if maybe_metrics is None:
-            payload["note"] = "run_trainval did not return metrics."
-        elif isinstance(maybe_metrics, dict):
-            payload = maybe_metrics
-        else:
-            payload["metrics"] = maybe_metrics
-        with open(args.out_metrics, "w") as f:
-            json.dump(payload, f, indent=2)
-        print(f"[SAVE] metrics -> {args.out_metrics}")
+    # 保存模型（CPU安全）
+    to_save = {"xin_graph_seq2seq_model": {k: v.cpu() for k, v in model.state_dict().items()}}
+    torch.save(to_save, args.out_model)
+    print(f"Saved model to {args.out_model}")
 
-if __name__ == "__main__":
+    # NEW: 保存metrics（可选；目录仅在需要时创建）
+    if args.metrics_out:
+        d = os.path.dirname(args.metrics_out)
+        if d:
+            os.makedirs(d, exist_ok=True)
+        payload = {
+            "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
+            "device": device.type,
+            "train_data": args.train_data,
+            "test_data": args.test_data,
+            "init_model": args.init_model,
+            "out_model": args.out_model,
+            "out_edge": args.out_edge,
+        }
+        try:
+            payload["run_trainval_return"] = ret
+        except Exception as e:
+            payload["run_trainval_return"] = f"<unserializable: {e}>"
+        with open(args.metrics_out, "w", encoding="utf-8") as f:
+            json.dump(payload, f, ensure_ascii=False, indent=2)
+        print(f"Saved metrics to {args.metrics_out}")
+
+if __name__ == '__main__':
     main()
