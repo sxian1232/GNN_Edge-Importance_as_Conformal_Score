@@ -348,15 +348,42 @@ def run_test(pra_model, pra_data_path):
 	loader_test = data_loader(pra_data_path, pra_batch_size=batch_size_test, pra_shuffle=False, pra_drop_last=False, train_val_test='test')
 	test_model(pra_model, loader_test)
 
+# -------- 新增：只评测，不训练 --------
+def run_eval_only(pra_model, pra_testdata_path):
+	loader_val = data_loader(
+		pra_testdata_path,
+		pra_batch_size=batch_size_val,
+		pra_shuffle=False,
+		pra_drop_last=False,
+		train_val_test='all'
+	)
+	sums, nums = val_model(pra_model, loader_val)
+	ws = display_result([sums, nums], pra_pref='EvalOnly')
+	return {
+		"ws_per_horizon": [float(x) for x in ws],
+		"ws_sum": float(np.sum(ws))
+	}
 
 
 if __name__ == '__main__':
-	graph_args={'max_hop':2, 'num_node':120}
-	model = Model(in_channels=4, graph_args=graph_args, edge_importance_weighting=True)
-	model.to(dev)
+    import argparse
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--eval-only', action='store_true', help='只评测，不训练')
+    parser.add_argument('--ckpt', type=str, default='', help='评测时加载的模型路径')
+    parser.add_argument('--train', type=str, default='./train_data.pkl')
+    parser.add_argument('--test', type=str, default='./test_data.pkl')
+    args = parser.parse_args()
 
-	# train and evaluate model
-	run_trainval(model, pra_traindata_path='./train_data.pkl', pra_testdata_path='./test_data.pkl')
+    graph_args={'max_hop':2, 'num_node':120}
+    model = Model(in_channels=4, graph_args=graph_args, edge_importance_weighting=True)
+    model.to(dev)
+
+    if args.eval_only:
+        assert args.ckpt, '只评测需要提供 --ckpt'
+        my_load_model(model, args.ckpt)
+        run_eval_only(model, pra_testdata_path=args.test)
+    else:
+        run_trainval(model, pra_traindata_path=args.train, pra_testdata_path=args.test)
 	
 	# pretrained_model_path = './trained_models/model_epoch_0016.pt'
 	# model = my_load_model(model, pretrained_model_path)
