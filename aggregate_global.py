@@ -27,38 +27,36 @@ def save_model_state(state, out_path):
     torch.save({"xin_graph_seq2seq_model": state}, out_path)
 
 def load_edge_vector(npy_path):
-    """读取 edge_importance.npy 并拉平成 1D 向量（会自动平均 layer/channel）"""
+    """
+    读取 edge_importance.npy 并拉平成 1D 向量（会自动平均 layer/channel）。
+    兼容形状：
+      [L,C,V,V] / [L,V,V] / [C,V,V] / [V,V] / [V*V]
+    """
     arr = np.load(npy_path, allow_pickle=True)
+
+    # 兼容 list/object 包装
     if isinstance(arr, np.ndarray) and arr.dtype == object:
-        # 可能是 list of arrays 存成了 object
         arr = np.array(list(arr), dtype=object)
+        if arr.dtype == object and len(arr) == 1:
+            arr = arr[0]
 
-    # 统一成 float 数组
-    if isinstance(arr, list):
-        arr = np.array(arr, dtype=object)
+    # 这里改成 np.asarray(...)（去掉 copy=False）
+    a = np.asarray(arr, dtype=np.float64)
 
-    # 将每个层的权重取平均到 [V, V]，再拼起来或直接整体平均后 flatten
-    # 常见形状：
-    #   [L, C, V, V] 或 [L, V, V] 或 [C, V, V] 或 [V, V]
-    a = arr
-    while a.dtype == object:
-        # 有些存法是 list-like，拍平到同一层次
-        a = np.array(list(a), dtype=object)
-        if a.dtype == object and len(a) == 1:
-            a = a[0]
+    # 已是扁平向量，直接返回
+    if a.ndim == 1:
+        return a.copy()
 
     if a.ndim == 4:
-        # [L, C, V, V] -> 先对 L,C 求平均 -> [V,V]
-        a = a.mean(axis=(0,1))
+        a = a.mean(axis=(0, 1))
     elif a.ndim == 3:
-        # [L, V, V] -> 对 L 求平均
         a = a.mean(axis=0)
     elif a.ndim == 2:
         pass
     else:
         raise ValueError(f"Unexpected edge importance shape: {a.shape} in {npy_path}")
 
-    return a.astype(np.float64, copy=False).ravel()
+    return a.ravel()
 
 # -----------------------------
 # Blocked MMD (内存友好)
